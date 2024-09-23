@@ -149,14 +149,23 @@ struct callback_helper {
     // build the stack arguments
     Local<Array> argStack = Array::New(isolate, args->stack_size);
     for (size_t i = 0; i < args->stack_size; i++) {
-      argStack->Set(i, String::NewFromUtf8(isolate, args->stack[i]));
+      v8::MaybeLocal<v8::String> maybeString = v8::String::NewFromUtf8(isolate, args->stack[i], v8::NewStringType::kNormal);
+      v8::Local<v8::String> localString;
+
+      if (!maybeString.ToLocal(&localString)) {
+        isolate->ThrowException(v8::Exception::Error(v8::String::NewFromUtf8Literal(isolate, "Failed to allocate string for stack frame")));
+        pthread_mutex_unlock(&args->mutex);
+        return;
+      }
+
+      argStack->Set(isolate->GetCurrentContext(), i, localString);
     }
 
     // collect all callback arguments
     Local<Value> argv[3] = {Number::New(isolate, args->signo), Number::New(isolate, args->addr), argStack};
 
     // execute the callback function on the main threaod
-    Local<Function>::New(isolate, *args->callback)->Call(isolate->GetCurrentContext()->Global(), 3, argv);
+    Local<Function>::New(isolate, *args->callback)->Call(isolate->GetCurrentContext(), isolate->GetCurrentContext()->Global(), 3, argv);
 
     // broadcast that we're done with the callback
     pthread_cond_broadcast(&args->cond);
@@ -164,6 +173,7 @@ struct callback_helper {
     // unlock the mutex
     pthread_mutex_unlock(&args->mutex);
   }
+
 };
 
 struct callback_helper* callback;
@@ -287,6 +297,7 @@ NAN_METHOD(CauseSegfault) {
 }
 
 NAN_METHOD(RegisterHandler) {
+  Isolate* isolate = Isolate::GetCurrent();
   // if passed a path, we'll set the log name to whatever is provided
   // this will allow users to use the logs in error reporting without redirecting
   // sdterr
@@ -294,15 +305,15 @@ NAN_METHOD(RegisterHandler) {
   if (info.Length() > 0) {
     for (int i = 0; i < info.Length(); i++) {
       if (info[i]->IsString()) {
-        String::Utf8Value utf8Value(info[i]->ToString());
-
         // need to do a copy to make sure the string doesn't become a dangling pointer
+        v8::String::Utf8Value utf8Value(isolate, info[i]->ToString(isolate->GetCurrentContext()).ToLocalChecked());
+
         int len = utf8Value.length();
         len = len > BUFF_SIZE ? BUFF_SIZE : len;
 
         strncpy(logPath, *utf8Value, len);
-        logPath[127] = '\0';
-      
+        logPath[BUFF_SIZE - 1] = '\0'; // Ensure null termination
+
       #ifndef _WIN32
       } else if (info[i]->IsFunction()) {
         if (callback) {
@@ -311,12 +322,12 @@ NAN_METHOD(RegisterHandler) {
         }
 
         // create the new callback object
-        callback = new callback_helper(Handle<Function>::Cast(info[i]));
+        callback = new callback_helper(v8::Local<v8::Function>::Cast(info[i]));
       #endif
-
       }
     }
   }
+
 
   #ifdef _WIN32
     AddVectoredExceptionHandler(1, segfault_handler);
